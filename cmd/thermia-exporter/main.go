@@ -58,14 +58,14 @@ func main() {
 	gLastOnlineUnix := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_last_online_unix", Help: "Last online timestamp (unix seconds)"}, labels)
 
 	// === Operation modes & statuses ===
-	gOperationMode := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operation_mode", Help: "Current operation mode (1 for current; one-hot)"}, append(labels, "mode"))
+	gOperationMode := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operation_mode", Help: "Current operation mode (1 for current)"}, append(labels, "mode"))
 	gOperationModeAvailable := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operation_mode_available", Help: "Available operation modes (1)"}, append(labels, "mode"))
 
-	// NOTE: We'll emit operational status as ONE-HOT (exactly one =1, others =0)
-	gOperationalStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operational_status_running", Help: "Operational status as one-hot (exactly one =1, others =0)"}, append(labels, "status"))
+	// One-hot operational status (exactly one = 1, rest = 0)
+	gOperationalStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operational_status_running", Help: "Operational status one-hot (1 for current, 0 for others)"}, append(labels, "status"))
 	gOperationalStatusAvail := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_operational_status_available", Help: "Operational statuses available (1)"}, append(labels, "status"))
 
-	// Power statuses remain bitmask (multiple can be true)
+	// Power statuses can remain bitmask-style (multiple may be 1)
 	gPowerStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_power_status_running", Help: "Power status bits that are running (1)"}, append(labels, "status"))
 	gPowerStatusAvail := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "thermia_power_status_available", Help: "Power statuses available (1)"}, append(labels, "status"))
 
@@ -163,38 +163,32 @@ func main() {
 					gCoolSupply.With(lbls).Set(v)
 				}
 
-				// Operation modes (one current marked as 1)
+				// Operation modes
 				for _, m := range sum.OperationModesAvailable {
 					gOperationModeAvailable.With(merge(lbls, "mode", m)).Set(1)
 				}
 				if sum.OperationMode != "" {
-					// Emit one-hot for modes as well: current=1, others=0
-					for _, m := range sum.OperationModesAvailable {
-						v := 0.0
-						if m == sum.OperationMode {
-							v = 1.0
-						}
-						gOperationMode.With(merge(lbls, "mode", m)).Set(v)
-					}
+					gOperationMode.With(merge(lbls, "mode", sum.OperationMode)).Set(1)
 				}
 
-				// Operational statuses: ONE-HOT (exactly one = 1, others = 0)
+				// Operational statuses (one-hot)
 				for _, s := range sum.OperationalStatusAvailable {
 					gOperationalStatusAvail.With(merge(lbls, "status", s)).Set(1)
 				}
 				curr := pickCurrentStatus(sum.OperationalStatusRunning, sum.OperationalStatusAvailable)
 				for _, s := range sum.OperationalStatusAvailable {
-					val := 0.0
+					v := 0.0
 					if strings.EqualFold(s, curr) {
-						val = 1.0
+						v = 1.0
 					}
-					gOperationalStatus.With(merge(lbls, "status", s)).Set(val)
+					gOperationalStatus.With(merge(lbls, "status", s)).Set(v)
 				}
 
-				// Power statuses remain bitmask (set 1 for running)
+				// Power statuses (bitmask)
 				for _, s := range sum.PowerStatusAvailable {
 					gPowerStatusAvail.With(merge(lbls, "status", s)).Set(1)
 				}
+				// Reset previously set power running to 0 before marking current as 1? Not necessary—series will be overwritten.
 				for _, s := range sum.PowerStatusRunning {
 					gPowerStatus.With(merge(lbls, "status", s)).Set(1)
 				}
@@ -256,7 +250,7 @@ func pickCurrentStatus(running, available []string) string {
 	if len(running) == 0 && len(available) == 0 {
 		return ""
 	}
-	// If NO_DEMAND is present with others, drop it.
+	// If both NO_DEMAND and another status are present, drop NO_DEMAND
 	filtered := make([]string, 0, len(running))
 	for _, s := range running {
 		if strings.EqualFold(s, "STATUS_NO_DEMAND") {
@@ -267,7 +261,7 @@ func pickCurrentStatus(running, available []string) string {
 	if len(filtered) == 0 {
 		filtered = running
 	}
-
+	// Priority order (highest first)
 	priority := []string{
 		"STATUS_LEGIONELLA",
 		"STATUS_HOTWATER",
@@ -283,26 +277,17 @@ func pickCurrentStatus(running, available []string) string {
 	for _, s := range filtered {
 		have[strings.ToUpper(s)] = struct{}{}
 	}
-	chosen := ""
 	for _, p := range priority {
 		if _, ok := have[p]; ok {
-			chosen = p
-			break
+			return p
 		}
 	}
-	if chosen == "" {
-		if len(filtered) > 0 {
-			chosen = filtered[0]
-		} else if len(available) > 0 {
-			chosen = available[0]
-		}
+	// Fallback: first running, or first available if none running
+	if len(filtered) > 0 {
+		return filtered[0]
 	}
-
-	// Return a value that matches one of the "available" strings (preserve case)
-	for _, s := range available {
-		if strings.EqualFold(s, chosen) {
-			return s
-		}
+	if len(available) > 0 {
+		return available[0]
 	}
-	return chosen
+	return ""
 }

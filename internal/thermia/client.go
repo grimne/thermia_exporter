@@ -41,10 +41,7 @@ const (
 )
 
 var operationalStatusCandidates = []string{
-	"REG_OPERATIONAL_STATUS_PRIORITY_BITMASK", // Atlas / priority-bitmask
-	"COMP_STATUS",                             // Diplomat
-	"COMP_STATUS_ATEC",                        // ATEC
-	"COMP_STATUS_ITEC",                        // ITEC
+	"REG_OPERATIONAL_STATUS_PRIORITY_BITMASK", "COMP_STATUS", "COMP_STATUS_ATEC", "COMP_STATUS_ITEC",
 }
 
 // ---- Public entrypoint ----
@@ -163,7 +160,7 @@ func FetchThermiaSummary(ctx context.Context, username, password string) (Thermi
 	// Modes
 	opModeName, opModes, _ := extractOperationMode(grpOperation)
 
-	// Operational/power statuses
+	// Statuses
 	runStatuses, allStatuses := extractBitmaskStatuses(grpStatus, operationalStatusCandidates)
 	runPower, allPower := extractBitmaskStatuses(grpStatus, []string{"COMP_POWER_STATUS"})
 
@@ -177,15 +174,15 @@ func FetchThermiaSummary(ctx context.Context, username, password string) (Thermi
 	lastUnix := parseTimeToUnix(info.LastOnline)
 
 	return ThermiaSummary{
-		HeatpumpID:                inst.ID,
-		HeatpumpName:              safe(info.Name, inst.Name),
-		HeatpumpModel:             model,
-		Online:                    info.IsOnline,
-		LastOnline:                info.LastOnline,
-		LastOnlineUnix:            lastUnix,
-		Temperatures:              tmap,
-		OperationModesAvailable:   opModes,
-		OperationMode:             opModeName,
+		HeatpumpID:                 inst.ID,
+		HeatpumpName:               safe(info.Name, inst.Name),
+		HeatpumpModel:              model,
+		Online:                     info.IsOnline,
+		LastOnline:                 info.LastOnline,
+		LastOnlineUnix:             lastUnix,
+		Temperatures:               tmap,
+		OperationModesAvailable:    opModes,
+		OperationMode:              opModeName,
 		OperationalStatusAvailable: allStatuses,
 		OperationalStatusRunning:   runStatuses,
 		PowerStatusAvailable:       allPower,
@@ -326,3 +323,428 @@ func exchangeCode(ctx context.Context, hc *http.Client, code, verifier string) (
 	res, err := hc.Do(req)
 	if err != nil {
 		return "", err
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("token endpoint %d: %s", res.StatusCode, string(b))
+	}
+	var tr struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(b, &tr); err != nil {
+		return "", err
+	}
+	if tr.AccessToken == "" {
+		return "", errors.New("no access_token")
+	}
+	return tr.AccessToken, nil
+}
+
+// ---- API calls ----
+func getConfiguration(ctx context.Context, hc *http.Client, token string) (Config, []byte, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", thermiaConfigURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		return Config{}, b, fmt.Errorf("GET %s returned %d: %s", thermiaConfigURL, res.StatusCode, string(b))
+	}
+	var cfg Config
+	_ = json.Unmarshal(b, &cfg)
+	return cfg, b, nil
+}
+
+func getInstallations(ctx context.Context, hc *http.Client, token, apiBase string) ([]byte, []Installation, error) {
+	u := strings.TrimRight(apiBase, "/") + "/api/v1/installationsInfo"
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		return b, nil, fmt.Errorf("GET %s returned %d: %s", u, res.StatusCode, string(b))
+	}
+	var wrap struct{ Items []Installation `json:"items"` }
+	if err := json.Unmarshal(b, &wrap); err == nil && len(wrap.Items) > 0 {
+		return b, wrap.Items, nil
+	}
+	var arr []Installation
+	if err := json.Unmarshal(b, &arr); err == nil {
+		return b, arr, nil
+	}
+	return b, nil, nil
+}
+
+func getInstallationInfo(ctx context.Context, hc *http.Client, token, apiBase string, id int64) (InstallationInfo, error) {
+	u := fmt.Sprintf("%s/api/v1/installations/%d", strings.TrimRight(apiBase, "/"), id)
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return InstallationInfo{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		return InstallationInfo{}, fmt.Errorf("GET %s returned %d: %s", u, res.StatusCode, string(b))
+	}
+	var info InstallationInfo
+	if err := json.NewDecoder(res.Body).Decode(&info); err != nil {
+		return InstallationInfo{}, err
+	}
+	return info, nil
+}
+
+func getInstallationStatus(ctx context.Context, hc *http.Client, token, apiBase string, id int64) (InstallationStatus, error) {
+	u := fmt.Sprintf("%s/api/v1/installationstatus/%d/status", strings.TrimRight(apiBase, "/"), id)
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return InstallationStatus{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		return InstallationStatus{}, fmt.Errorf("GET %s returned %d: %s", u, res.StatusCode, string(b))
+	}
+	var st InstallationStatus
+	if err := json.NewDecoder(res.Body).Decode(&st); err != nil {
+		return InstallationStatus{}, err
+	}
+	return st, nil
+}
+
+func getRegisterGroup(ctx context.Context, hc *http.Client, token, apiBase string, id int64, group string) ([]GroupItem, error) {
+	u := fmt.Sprintf("%s/api/v1/Registers/Installations/%d/Groups/%s", strings.TrimRight(apiBase, "/"), id, group)
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, nil
+	}
+	var items []GroupItem
+	if err := json.NewDecoder(res.Body).Decode(&items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func getEvents(ctx context.Context, hc *http.Client, token, apiBase string, id int64, onlyActive bool) ([]Event, error) {
+	u := fmt.Sprintf("%s/api/v1/installation/%d/events?onlyActiveAlarms=%v", strings.TrimRight(apiBase, "/"), id, onlyActive)
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	res, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, nil
+	}
+	var evts []Event
+	if err := json.NewDecoder(res.Body).Decode(&evts); err != nil {
+		return nil, err
+	}
+	return evts, nil
+}
+
+// ---- helpers & mappers ----
+func extractSettings(html string) string {
+	re := regexp.MustCompile(`var SETTINGS = ([\s\S]*?});`)
+	m := re.FindStringSubmatch(html)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+func randomChallenge(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+	var sb strings.Builder
+	sb.Grow(n)
+	x := time.Now().UnixNano()
+	for i := 0; i < n; i++ {
+		x = (x*1664525 + 1013904223) & 0x7fffffff
+		sb.WriteByte(alphabet[int(x)%len(alphabet)])
+	}
+	return sb.String()
+}
+func pkceS256(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func findValue(items []GroupItem, registerName string) (*float64, bool) {
+	for _, it := range items {
+		if it.RegisterName == registerName && it.RegisterValue != nil {
+			return it.RegisterValue, true
+		}
+	}
+	return nil, false
+}
+
+func trimMode(s string) string {
+	s = strings.TrimPrefix(s, "REG_VALUE_OPERATION_MODE_")
+	s = strings.TrimPrefix(s, "REG_VALUE_")
+	return s
+}
+func trimStatus(s string) string {
+	for _, p := range []string{"REG_VALUE_", "COMP_VALUE_"} {
+		if strings.HasPrefix(s, p) {
+			return strings.TrimPrefix(s, p)
+		}
+	}
+	return s
+}
+func safe(v, fb string) string { v = strings.TrimSpace(v); if v == "" { return fb }; return v }
+func round1(f float64) float64 { return float64(int(f*10+0.5)) / 10.0 }
+
+func deriveTemperatures(st InstallationStatus, grp []GroupItem) tempsOut {
+	out := tempsOut{
+		Indoor:     st.IndoorTemperature,
+		HotWater:   st.HotWaterTemperature,
+		SupplyLine: st.SupplyLine,
+		DesiredSupplyLine: func() *float64 {
+			if st.DesiredSupplyLineTemperature != nil {
+				return st.DesiredSupplyLineTemperature
+			}
+			if v, ok := findValue(grp, "REG_DESIRED_SUPPLY_LINE_TEMP"); ok {
+				return v
+			}
+			if v, ok := findValue(grp, "REG_DESIRED_SUPPLY_LINE"); ok {
+				return v
+			}
+			if v, ok := findValue(grp, "REG_DESIRED_SYS_SUPPLY_LINE_TEMP"); ok {
+				return v
+			}
+			return nil
+		}(),
+		BufferTank: st.BufferTankTemperature,
+		ReturnLine: func() *float64 {
+			if st.ReturnLineTemperature != nil {
+				return st.ReturnLineTemperature
+			}
+			if v, ok := findValue(grp, "REG_RETURN_LINE"); ok {
+				return v
+			}
+			if v, ok := findValue(grp, "REG_OPER_DATA_RETURN"); ok {
+				return v
+			}
+			return nil
+		}(),
+		BrineOut:      st.BrineOutTemperature,
+		BrineIn:       st.BrineInTemperature,
+		Pool:          st.PoolTemperature,
+		CoolingTank:   st.CoolingTankTemperature,
+		CoolingSupply: st.CoolingSupplyLineTemperature,
+	}
+	if out.Indoor == nil {
+		if v, ok := findValue(grp, "REG_INDOOR_TEMPERATURE"); ok {
+			out.Indoor = v
+		}
+	}
+	if out.SupplyLine == nil {
+		if v, ok := findValue(grp, "REG_SUPPLY_LINE"); ok {
+			out.SupplyLine = v
+		}
+	}
+	if out.BufferTank == nil {
+		if v, ok := findValue(grp, "REG_OPER_DATA_BUFFER_TANK"); ok {
+			out.BufferTank = v
+		}
+	}
+	if out.BrineOut == nil {
+		if v, ok := findValue(grp, "REG_BRINE_OUT"); ok {
+			out.BrineOut = v
+		}
+	}
+	if out.BrineIn == nil {
+		if v, ok := findValue(grp, "REG_BRINE_IN"); ok {
+			out.BrineIn = v
+		}
+	}
+	if out.Pool == nil {
+		if v, ok := findValue(grp, "REG_ACTUAL_POOL_TEMP"); ok {
+			out.Pool = v
+		}
+	}
+	if out.CoolingTank == nil {
+		if v, ok := findValue(grp, "REG_COOL_SENSOR_TANK"); ok {
+			out.CoolingTank = v
+		}
+	}
+	if out.CoolingSupply == nil {
+		if v, ok := findValue(grp, "REG_COOL_SENSOR_SUPPLY"); ok {
+			out.CoolingSupply = v
+		}
+	}
+	return out
+}
+
+func extractOperationMode(items []GroupItem) (current string, available []string, readOnly *bool) {
+	for _, it := range items {
+		if it.RegisterName == "REG_OPERATIONMODE" {
+			available = []string{}
+			for _, vn := range it.ValueNames {
+				if vn.Visible {
+					available = append(available, trimMode(vn.Name))
+				}
+			}
+			readOnly = &it.IsReadOnly
+			if it.RegisterValue != nil {
+				val := int(*it.RegisterValue + 0.00001)
+				for _, vn := range it.ValueNames {
+					if vn.Value == val {
+						current = trimMode(vn.Name)
+						break
+					}
+				}
+			}
+			break
+		}
+	}
+	return
+}
+
+func extractBitmaskStatuses(items []GroupItem, registerNames []string) (running []string, available []string) {
+	var match *GroupItem
+	for _, rn := range registerNames {
+		for i := range items {
+			if items[i].RegisterName == rn {
+				match = &items[i]
+				break
+			}
+		}
+		if match != nil {
+			break
+		}
+	}
+	if match == nil {
+		return nil, nil
+	}
+	for _, vn := range match.ValueNames {
+		if vn.Visible {
+			available = append(available, trimStatus(vn.Name))
+		}
+	}
+	if match.RegisterValue == nil {
+		return []string{}, available
+	}
+	val := int(*match.RegisterValue + 0.00001)
+	for _, vn := range match.ValueNames {
+		if vn.Visible && (val&vn.Value) != 0 {
+			running = append(running, trimStatus(vn.Name))
+		}
+	}
+	return
+}
+
+// --- missing helpers restored ---
+
+// extractHotWaterSwitches returns pointer states for hot water switch and boost (0/1 when present)
+func extractHotWaterSwitches(items []GroupItem) (switchState *int, boostState *int) {
+	for _, it := range items {
+		switch it.RegisterName {
+		case "REG__HOT_WATER_BOOST":
+			if it.RegisterValue != nil {
+				v := int(*it.RegisterValue + 0.00001)
+				boostState = &v
+			}
+		case "REG_HOT_WATER_STATUS":
+			if it.RegisterValue != nil {
+				v := int(*it.RegisterValue + 0.00001)
+				switchState = &v
+			}
+		}
+	}
+	return
+}
+
+// extractOperationalTime maps known time registers (hours) to a simple map
+func extractOperationalTime(items []GroupItem) map[string]int {
+	keys := []string{
+		"REG_OPER_TIME_COMPRESSOR",
+		"REG_OPER_TIME_HEATING",
+		"REG_OPER_TIME_HOT_WATER",
+		"REG_OPER_TIME_IMM1",
+		"REG_OPER_TIME_IMM2",
+		"REG_OPER_TIME_IMM3",
+	}
+	out := map[string]int{}
+	for _, k := range keys {
+		for _, it := range items {
+			if it.RegisterName == k && it.RegisterValue != nil {
+				out[k] = int(*it.RegisterValue + 0.00001)
+			}
+		}
+	}
+	return out
+}
+
+// helpers used by alerts mapping
+func uniqueTitles(evts []Event) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, e := range evts {
+		t := strings.TrimSpace(e.EventTitle)
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
+}
+func difference(all, active []string) []string {
+	set := map[string]struct{}{}
+	for _, a := range active {
+		set[a] = struct{}{}
+	}
+	out := []string{}
+	for _, t := range all {
+		if _, ok := set[t]; !ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// parse time (best-effort) -> unix seconds
+func parseTimeToUnix(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	layouts := []string{
+		"2006-01-02T15:04:05.000Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+	}
+	var t time.Time
+	var err error
+	for _, l := range layouts {
+		t, err = time.Parse(l, s)
+		if err == nil {
+			return t.Unix()
+		}
+	}
+	return 0
+}
