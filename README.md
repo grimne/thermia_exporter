@@ -48,7 +48,7 @@ export THERMIA_PASSWORD="your_password"
 ```
 
 ### Docker
-Repo: https://github.com/users/grimne/packages/container/package/thermia-exporter
+Container repo: https://github.com/grimne/thermia_exporter/pkgs/container/thermia_exporter
 
 ```bash
 docker build -t thermia-exporter .
@@ -86,7 +86,7 @@ spec:
     spec:
       containers:
       - name: exporter
-        image: https://github.com/users/grimne/packages/container/package/thermia-exporter:latest
+        image: ghcr.io/grimne/thermia_exporter:latest
         ports:
         - containerPort: 9808
           name: metrics
