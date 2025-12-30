@@ -6,9 +6,6 @@ on:
       - master
     tags:
       - 'v*'
-  pull_request:
-    branches:
-      - master
 
 env:
   REGISTRY: ghcr.io
@@ -53,7 +50,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64  # Add linux/arm64 when ready for multi-arch
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
