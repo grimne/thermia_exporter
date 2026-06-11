@@ -11,7 +11,7 @@ It authenticates with the Thermia Online API using OAuth2 and exposes comprehens
 - Metrics coverage: Temperatures, operation modes, statuses, hot water, operational time, alerts
 - Native support for mounted Kubernetes secrets, health endpoint, handles SIGTERM/SIGINT for clean and graceful shutdown
 - Collects from the Thermia API in a background loop (default every 15 min); `/metrics` serves the cached result instantly, so slow upstream responses never fail a Prometheus scrape
-- Authenticates once and reuses the token until expiry (~1h), minimizing login attempts
+- Logs in once, then renews via the OAuth2 refresh-token grant (~hourly); a full password login is only used at startup or if the refresh fails
 - Uses `slog` for JSON/text logging with contextual fields
 - Continues with partial data if some API calls fail
 - Reuses HTTP connections for better performance

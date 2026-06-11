@@ -142,14 +142,39 @@ func (c *ThermiaCollector) getOrRefreshToken(ctx context.Context) (*auth.AuthRes
 		return c.tokenCache, nil
 	}
 
-	// Perform authentication
-	c.logger.Info("Authenticating to Thermia API", "reason", "token expired or missing")
+	// Try the lightweight refresh-token grant before a full password login
+	if c.tokenCache != nil && c.tokenCache.RefreshToken != "" {
+		authResult, err := c.authClient.Refresh(ctx, c.tokenCache.RefreshToken)
+		if err == nil {
+			// Keep the old refresh token if the server didn't rotate it
+			if authResult.RefreshToken == "" {
+				authResult.RefreshToken = c.tokenCache.RefreshToken
+			}
+			c.cacheToken(authResult)
+			c.logger.Info("Token refreshed", "expires_in",
+				time.Until(c.tokenExpiresAt).Round(time.Second))
+			return authResult, nil
+		}
+		c.logger.Warn("Token refresh failed, falling back to full login", "error", err)
+	}
+
+	// Perform full authentication
+	c.logger.Info("Authenticating to Thermia API", "reason", "no valid token or refresh failed")
 	authResult, err := c.authClient.Authenticate(ctx, c.creds)
 	if err != nil {
 		return nil, err
 	}
+	c.cacheToken(authResult)
 
-	// Cache the token
+	c.logger.Info("Authentication successful, token cached",
+		"expires_in", time.Until(c.tokenExpiresAt).Round(time.Second))
+
+	return authResult, nil
+}
+
+// cacheToken stores the auth result and computes its expiry with a safety
+// margin. Caller must hold tokenCacheMu.
+func (c *ThermiaCollector) cacheToken(authResult *auth.AuthResult) {
 	c.tokenCache = authResult
 	// Set expiration to 5 minutes before actual expiry for safety margin
 	expiresIn := time.Duration(authResult.ExpiresIn) * time.Second
@@ -157,11 +182,6 @@ func (c *ThermiaCollector) getOrRefreshToken(ctx context.Context) (*auth.AuthRes
 		expiresIn -= 5 * time.Minute
 	}
 	c.tokenExpiresAt = time.Now().Add(expiresIn)
-
-	c.logger.Info("Authentication successful, token cached",
-		"expires_in", expiresIn.Round(time.Second))
-
-	return authResult, nil
 }
 
 // Describe implements prometheus.Collector.

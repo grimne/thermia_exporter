@@ -249,6 +249,18 @@ func (a *AuthClient) confirmAndGetCode(ctx context.Context, state *authState) (s
 	return "", errors.New("no authorization code returned")
 }
 
+// Refresh exchanges a refresh token for a new access token without a full
+// login. The result carries a rotated refresh token when the server issues one.
+func (a *AuthClient) Refresh(ctx context.Context, refreshToken string) (*AuthResult, error) {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("client_id", clientID)
+	form.Set("scope", scope)
+	form.Set("refresh_token", refreshToken)
+
+	return a.requestToken(ctx, form)
+}
+
 // exchangeCode exchanges the authorization code for an access token.
 func (a *AuthClient) exchangeCode(ctx context.Context, code, verifier string) (*AuthResult, error) {
 	form := url.Values{}
@@ -259,6 +271,11 @@ func (a *AuthClient) exchangeCode(ctx context.Context, code, verifier string) (*
 	form.Set("code", code)
 	form.Set("code_verifier", verifier)
 
+	return a.requestToken(ctx, form)
+}
+
+// requestToken posts a grant request to the token endpoint and parses the result.
+func (a *AuthClient) requestToken(ctx context.Context, form url.Values) (*AuthResult, error) {
 	req, _ := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 
