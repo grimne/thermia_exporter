@@ -18,6 +18,9 @@ type Config struct {
 	ListenAddr     string
 	RequestTimeout time.Duration
 
+	// Background collection interval (how often the Thermia API is polled)
+	CollectInterval time.Duration
+
 	// Logging configuration
 	LogLevel  string // debug, info, warn, error
 	LogFormat string // text, json
@@ -28,10 +31,11 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		// Set defaults
-		ListenAddr:     ":9808",
-		RequestTimeout: 2 * time.Minute,
-		LogLevel:       "info",
-		LogFormat:      "text",
+		ListenAddr:      ":9808",
+		RequestTimeout:  2 * time.Minute,
+		CollectInterval: 15 * time.Minute,
+		LogLevel:        "info",
+		LogFormat:       "text",
 	}
 
 	// Try to load from Kubernetes secrets first
@@ -64,6 +68,12 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	if interval := os.Getenv("THERMIA_SCRAPE_INTERVAL"); interval != "" {
+		if seconds, err := strconv.Atoi(interval); err == nil && seconds > 0 {
+			cfg.CollectInterval = time.Duration(seconds) * time.Second
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -77,6 +87,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RequestTimeout < 10*time.Second {
 		return errors.New("request timeout must be at least 10 seconds")
+	}
+	if c.CollectInterval < time.Minute {
+		return errors.New("scrape interval must be at least 60 seconds")
 	}
 	return nil
 }

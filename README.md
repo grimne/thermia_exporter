@@ -10,7 +10,7 @@ It authenticates with the Thermia Online API using OAuth2 and exposes comprehens
 
 - Metrics coverage: Temperatures, operation modes, statuses, hot water, operational time, alerts
 - Native support for mounted Kubernetes secrets, health endpoint, handles SIGTERM/SIGINT for clean and graceful shutdown
-- Scrapes data on-demand when Prometheus requests `/metrics`, not on a fixed interval with low-cardinality labels
+- Collects from the Thermia API in a background loop (default every 15 min); `/metrics` serves the cached result instantly, so slow upstream responses never fail a Prometheus scrape
 - Authenticates once and reuses the token until expiry (~1h), minimizing login attempts
 - Uses `slog` for JSON/text logging with contextual fields
 - Continues with partial data if some API calls fail
@@ -26,7 +26,7 @@ It authenticates with the Thermia Online API using OAuth2 and exposes comprehens
 - **Hot water controls** (switch state, boost mode)
 - **Operational time counters** (hours for compressor, heating, hot water, aux heaters)
 - **Alert counts** (active and archived)
-- **Scrape metrics** (errors, duration)
+- **Collection metrics** (errors, duration, last-success timestamp)
 
 ---
 
@@ -145,6 +145,7 @@ spec:
 | `THERMIA_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `THERMIA_LOG_FORMAT` | No | `text` | Log format: `text`, `json` |
 | `THERMIA_REQUEST_TIMEOUT` | No | `120` | API request timeout in seconds |
+| `THERMIA_SCRAPE_INTERVAL` | No | `900` | Background collection interval in seconds (min 60) |
 | `THERMIA_SECRETS_PATH` | No | `/var/run/secrets/thermia` | Path to mounted Kubernetes secrets |
 
 \* Not required if using Kubernetes secrets
@@ -216,18 +217,15 @@ Check logs for warnings like:
 level=WARN msg="Failed to get temperature registers" id=1234567 error="status 404"
 ```
 
-### Prometheus Scrape Timeouts
+### Stale Data
 
-If scrapes are timing out, increase the scrape timeout in Prometheus:
-```yaml
-scrape_configs:
-  - job_name: 'thermia'
-    scrape_interval: 300s
-    scrape_timeout: 30s  # Increase if needed
-    static_configs:
-      - targets: ['thermia-exporter:9808']
+Metrics are collected in the background every `THERMIA_SCRAPE_INTERVAL` seconds and served from cache, so Prometheus scrapes never time out on slow Thermia API responses. If a collection fails, the previous result keeps being served and `thermia_scrape_errors_total` increments. Alert on staleness with:
+
+```promql
+time() - thermia_last_collection_success_timestamp_seconds > 2 * 900
 ```
-Or using `vmagent`
+
+Example scrape config using `vmagent`:
 ```yaml
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
@@ -244,7 +242,7 @@ spec:
     - port: metrics
       path: /metrics
       interval: 300s
-      scrapeTimeout: 30s
+      scrapeTimeout: 10s
       scheme: http
       honorLabels: true
 ```

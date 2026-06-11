@@ -105,13 +105,27 @@ func TestValidate_InvalidTimeout(t *testing.T) {
 
 func TestValidate_Valid(t *testing.T) {
 	cfg := &Config{
-		Username:       "user@example.com",
-		Password:       "password",
-		RequestTimeout: 30 * time.Second,
+		Username:        "user@example.com",
+		Password:        "password",
+		RequestTimeout:  30 * time.Second,
+		CollectInterval: 15 * time.Minute,
 	}
 
 	err := cfg.Validate()
 	if err != nil {
 		t.Errorf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestValidate_CollectIntervalTooShort(t *testing.T) {
+	cfg := &Config{
+		Username:        "user@example.com",
+		Password:        "password",
+		RequestTimeout:  30 * time.Second,
+		CollectInterval: 30 * time.Second,
+	}
+
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() expected error for collect interval < 60s, got nil")
 	}
 }

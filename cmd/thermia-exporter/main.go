@@ -32,7 +32,8 @@ func main() {
 
 	// Setup logging
 	logger := setupLogger(cfg.LogLevel, cfg.LogFormat)
-	logger.Info("Starting Thermia Exporter", "listen_addr", cfg.ListenAddr)
+	logger.Info("Starting Thermia Exporter",
+		"listen_addr", cfg.ListenAddr, "collect_interval", cfg.CollectInterval)
 
 	// Create authentication client
 	authClient := auth.NewAuthClient(logger)
@@ -42,8 +43,14 @@ func main() {
 	}
 
 	// Create and register Prometheus collector
-	thermiaCollector := collector.NewThermiaCollector(authClient, creds, logger)
+	thermiaCollector := collector.NewThermiaCollector(authClient, creds, cfg.RequestTimeout, logger)
 	prometheus.MustRegister(thermiaCollector)
+
+	// Collect from the Thermia API in the background; /metrics serves the
+	// cached result so slow upstream responses never fail a scrape.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go thermiaCollector.Run(ctx, cfg.CollectInterval)
 
 	// Setup HTTP server
 	mux := http.NewServeMux()
@@ -67,18 +74,16 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+	// Wait for shutdown signal (cancels the collection loop too)
+	<-ctx.Done()
 
 	logger.Info("Shutting down gracefully...")
 
 	// Graceful shutdown with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Shutdown error", "error", err)
 	}
 

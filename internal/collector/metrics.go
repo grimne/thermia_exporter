@@ -53,6 +53,7 @@ type MetricSet struct {
 	// Scrape metrics
 	scrapeErrors   prometheus.Counter
 	scrapeDuration prometheus.Histogram
+	lastSuccess    prometheus.Gauge
 }
 
 // newMetricSet creates all metric descriptors.
@@ -231,8 +232,12 @@ func newMetricSet() *MetricSet {
 		}),
 		scrapeDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "thermia_scrape_duration_seconds",
-			Help:    "Time spent scraping Thermia API",
+			Help:    "Time spent collecting from the Thermia API (background loop)",
 			Buckets: []float64{1, 5, 10, 30, 60, 120},
+		}),
+		lastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "thermia_last_collection_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful Thermia API collection",
 		}),
 	}
 }

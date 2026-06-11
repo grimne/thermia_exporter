@@ -18,26 +18,104 @@ import (
 )
 
 // ThermiaCollector implements prometheus.Collector for Thermia heat pumps.
+// Collection from the Thermia cloud API runs in a background loop (Run);
+// Prometheus scrapes are served from the cached result so slow upstream
+// responses never delay or time out a scrape.
 type ThermiaCollector struct {
-	authClient *auth.AuthClient
-	creds      auth.Credentials
-	logger     *slog.Logger
-	metrics    *MetricSet
+	authClient   *auth.AuthClient
+	creds        auth.Credentials
+	logger       *slog.Logger
+	metrics      *MetricSet
+	fetchTimeout time.Duration
 
 	// Token cache to minimize login attempts
 	tokenCache     *auth.AuthResult
 	tokenCacheMu   sync.RWMutex
 	tokenExpiresAt time.Time
+
+	// Cached metrics from the last successful background collection
+	cacheMu sync.RWMutex
+	cached  []prometheus.Metric
 }
 
 // NewThermiaCollector creates a new Thermia collector.
-func NewThermiaCollector(authClient *auth.AuthClient, creds auth.Credentials, logger *slog.Logger) *ThermiaCollector {
+func NewThermiaCollector(authClient *auth.AuthClient, creds auth.Credentials, fetchTimeout time.Duration, logger *slog.Logger) *ThermiaCollector {
 	return &ThermiaCollector{
-		authClient: authClient,
-		creds:      creds,
-		logger:     logger,
-		metrics:    newMetricSet(),
+		authClient:   authClient,
+		creds:        creds,
+		logger:       logger,
+		metrics:      newMetricSet(),
+		fetchTimeout: fetchTimeout,
 	}
+}
+
+// Run starts the background collection loop. It collects once immediately,
+// then every interval until ctx is cancelled.
+func (c *ThermiaCollector) Run(ctx context.Context, interval time.Duration) {
+	c.logger.Info("Starting background collection loop", "interval", interval)
+	c.refresh(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Info("Background collection loop stopped")
+			return
+		case <-ticker.C:
+			c.refresh(ctx)
+		}
+	}
+}
+
+// refresh performs one collection from the Thermia API and replaces the
+// cache on success. On failure the previous cache is kept and served.
+func (c *ThermiaCollector) refresh(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancel()
+
+	start := time.Now()
+	collected, err := c.fetch(ctx)
+	duration := time.Since(start)
+	c.metrics.scrapeDuration.Observe(duration.Seconds())
+
+	if err != nil {
+		c.metrics.scrapeErrors.Inc()
+		c.logger.Error("Collection failed, serving previous cached metrics",
+			"error", err, "duration", duration.Round(time.Millisecond))
+		return
+	}
+
+	c.cacheMu.Lock()
+	c.cached = collected
+	c.cacheMu.Unlock()
+	c.metrics.lastSuccess.SetToCurrentTime()
+
+	c.logger.Debug("Collection complete",
+		"metrics", len(collected), "duration", duration.Round(time.Millisecond))
+}
+
+// fetch runs a full collection and returns the gathered metrics as a slice.
+func (c *ThermiaCollector) fetch(ctx context.Context) ([]prometheus.Metric, error) {
+	ch := make(chan prometheus.Metric, 64)
+	var collected []prometheus.Metric
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for m := range ch {
+			collected = append(collected, m)
+		}
+	}()
+
+	err := c.collect(ctx, ch)
+	close(ch)
+	<-done
+
+	if err != nil {
+		return nil, err
+	}
+	return collected, nil
 }
 
 // getOrRefreshToken returns a cached token if valid, or authenticates to get a new one.
@@ -133,74 +211,67 @@ func (c *ThermiaCollector) Describe(ch chan<- *prometheus.Desc) {
 	// Scrape metrics
 	c.metrics.scrapeErrors.Describe(ch)
 	c.metrics.scrapeDuration.Describe(ch)
+	c.metrics.lastSuccess.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
-// It performs on-demand scraping when Prometheus scrapes the /metrics endpoint.
+// It serves the cached metrics from the background collection loop and never
+// performs network calls, so scrapes complete instantly.
 func (c *ThermiaCollector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	c.cacheMu.RLock()
+	cached := c.cached
+	c.cacheMu.RUnlock()
 
-	start := time.Now()
-	defer func() {
-		duration := time.Since(start).Seconds()
-		c.metrics.scrapeDuration.Observe(duration)
-		c.metrics.scrapeDuration.Collect(ch)
-	}()
+	for _, m := range cached {
+		ch <- m
+	}
 
+	c.metrics.scrapeErrors.Collect(ch)
+	c.metrics.scrapeDuration.Collect(ch)
+	c.metrics.lastSuccess.Collect(ch)
+}
+
+// collect performs one full collection from the Thermia API, emitting metrics
+// on ch. It returns an error if nothing useful could be collected.
+func (c *ThermiaCollector) collect(ctx context.Context, ch chan<- prometheus.Metric) error {
 	// Get or refresh authentication token
-	c.logger.Debug("Starting scrape")
 	authResult, err := c.getOrRefreshToken(ctx)
 	if err != nil {
-		c.metrics.scrapeErrors.Inc()
-		c.metrics.scrapeErrors.Collect(ch)
-		c.logger.Error("Authentication failed during scrape", "error", err)
-		return
+		return fmt.Errorf("authentication: %w", err)
 	}
 
 	// Create API client
 	apiClient, err := api.NewAPIClient(ctx, authResult.AccessToken, c.logger)
 	if err != nil {
-		c.metrics.scrapeErrors.Inc()
-		c.metrics.scrapeErrors.Collect(ch)
-		c.logger.Error("Failed to create API client", "error", err)
-		return
+		return fmt.Errorf("create API client: %w", err)
 	}
 
 	// Get installations
 	installations, err := apiClient.GetInstallations(ctx)
 	if err != nil {
-		c.metrics.scrapeErrors.Inc()
-		c.metrics.scrapeErrors.Collect(ch)
-		c.logger.Error("Failed to get installations", "error", err)
-		return
+		return fmt.Errorf("get installations: %w", err)
 	}
 
 	if len(installations) == 0 {
-		c.logger.Warn("No installations found")
-		c.metrics.scrapeErrors.Collect(ch)
-		return
+		return fmt.Errorf("no installations found")
 	}
 
 	// Collect metrics for the first installation (as per requirements)
-	c.collectInstallation(ctx, ch, apiClient, installations[0])
-	c.metrics.scrapeErrors.Collect(ch)
+	return c.collectInstallation(ctx, ch, apiClient, installations[0])
 }
 
 // collectInstallation collects all metrics for a single installation.
-func (c *ThermiaCollector) collectInstallation(ctx context.Context, ch chan<- prometheus.Metric, apiClient *api.APIClient, inst types.Installation) {
+func (c *ThermiaCollector) collectInstallation(ctx context.Context, ch chan<- prometheus.Metric, apiClient *api.APIClient, inst types.Installation) error {
 	// Fetch installation info
 	info, err := apiClient.GetInstallationInfo(ctx, inst.ID)
 	if err != nil {
-		c.logger.Error("Failed to get installation info", "id", inst.ID, "error", err)
-		return
+		return fmt.Errorf("get installation info (id %d): %w", inst.ID, err)
 	}
 
 	// Fetch installation status
 	status, err := apiClient.GetInstallationStatus(ctx, inst.ID)
 	if err != nil {
-		c.logger.Error("Failed to get installation status", "id", inst.ID, "error", err)
-		return
+		return fmt.Errorf("get installation status (id %d): %w", inst.ID, err)
 	}
 
 	// Fetch register groups (with error logging, but continue with partial data)
@@ -257,6 +328,8 @@ func (c *ThermiaCollector) collectInstallation(ctx context.Context, ch chan<- pr
 	c.emitHotWaterMetrics(ch, labels, grpHot)
 	c.emitOperationalTimeMetrics(ch, labels, grpTime)
 	c.emitAlertMetrics(ch, labels, activeEvents, allEvents)
+
+	return nil
 }
 
 // emitTemperatureMetrics emits all temperature metrics.
